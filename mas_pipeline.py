@@ -45,13 +45,39 @@ class GraphState(TypedDict):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3. LLM Factory
+# 3. LLM Factory (with retry for rate limits)
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ── Change this to switch models globally ──
+# Free-tier models with separate quota buckets you can try:
+#   "gemini-2.0-flash-lite-001"  ← lightweight, generous free quota
+#   "gemini-2.0-flash-001"       ← standard flash
+#   "gemini-1.5-flash"           ← older but very stable
+MODEL_NAME = "gemini-2.0-flash-lite-001"
+
+import time
+
+
+def _invoke_with_retry(llm, messages, max_retries: int = 5):
+    """Invoke the LLM with exponential backoff on rate-limit (429) errors."""
+    for attempt in range(max_retries):
+        try:
+            return llm.invoke(messages)
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                wait = min(2 ** attempt * 10, 120)  # 10s, 20s, 40s, 80s, 120s
+                print(f"[RateLimit] ⏳ Quota hit — waiting {wait}s before retry {attempt + 1}/{max_retries} …")
+                time.sleep(wait)
+            else:
+                raise  # Non-rate-limit errors propagate immediately
+    raise RuntimeError(f"Failed after {max_retries} retries due to rate limiting.")
+
 
 def _get_llm(temperature: float = 0.2) -> ChatGoogleGenerativeAI:
     """Return a ChatGoogleGenerativeAI instance pointed at a capable model."""
     return ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash-001",
+        model=MODEL_NAME,
         temperature=temperature,
         max_output_tokens=8192,
     )
@@ -92,7 +118,7 @@ def data_curator(state: GraphState) -> dict:
         - The script must be self-contained (import everything it needs).
     """)
 
-    response = llm.invoke([
+    response = _invoke_with_retry(llm, [
         SystemMessage(content="You are a senior data engineer. Output ONLY executable Python code, nothing else."),
         HumanMessage(content=prompt),
     ])
@@ -179,7 +205,7 @@ def systems_architect(state: GraphState) -> dict:
         Output ONLY the Python code. No markdown fences, no commentary.
     """)
 
-    response = llm.invoke([
+    response = _invoke_with_retry(llm, [
         SystemMessage(content="You are a senior ML engineer. Output ONLY valid, executable Python code."),
         HumanMessage(content=prompt),
     ])
@@ -264,7 +290,7 @@ def critic(state: GraphState) -> dict:
         Respond with ONLY "SUCCESS" or your error analysis. Nothing else.
     """)
 
-    response = llm.invoke([
+    response = _invoke_with_retry(llm, [
         SystemMessage(content="You are a precise code reviewer. Be concise."),
         HumanMessage(content=prompt),
     ])
@@ -322,7 +348,7 @@ def mlops_engineer(state: GraphState) -> dict:
         Output ONLY the Python code. No markdown fences, no commentary.
     """)
 
-    response = llm.invoke([
+    response = _invoke_with_retry(llm, [
         SystemMessage(content="You are a senior MLOps engineer. Output ONLY valid Python code."),
         HumanMessage(content=prompt),
     ])
@@ -390,7 +416,7 @@ def hf_publisher(state: GraphState) -> dict:
         Output ONLY the repo name, nothing else. Example: "synthetic-image-classifier"
     """)
 
-    naming_response = llm.invoke([
+    naming_response = _invoke_with_retry(llm, [
         SystemMessage(content="Output only a valid HF repo name. No quotes, no explanation."),
         HumanMessage(content=naming_prompt),
     ])
@@ -436,7 +462,7 @@ def hf_publisher(state: GraphState) -> dict:
         Output ONLY the markdown. No code fences wrapping the whole thing.
     """)
 
-    card_response = llm.invoke([
+    card_response = _invoke_with_retry(llm, [
         SystemMessage(content="You are a technical writer. Output valid markdown."),
         HumanMessage(content=card_prompt),
     ])
