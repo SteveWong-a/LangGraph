@@ -151,9 +151,9 @@ def data_curator(state: GraphState) -> dict:
         Step 3: Write a COMPLETE Python script that:
           - Uses the `datasets` library from HuggingFace to download a relevant
             real-world image dataset. Pick one that closely matches the task.
-            Good options: "cifar10", "food101", "beans", "cats_vs_dogs",
-            "fashion_mnist", "mnist", "eurosat", "oxford_flowers102", etc.
+            Good options: "cifar10", "food101", "cats_vs_dogs", "fashion_mnist"
           - Downloads images based on your volume decision from Step 2.
+          - You MUST create the directory: `os.makedirs("./real_dataset/raw/", exist_ok=True)`
           - Saves images as PNG files into "./real_dataset/raw/" folder.
           - Each image should be saved as "img_NNNN.png" (sequential numbering).
           - Print the class names as: "CLASSES: cat, dog, bird"
