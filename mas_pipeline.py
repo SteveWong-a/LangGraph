@@ -139,7 +139,7 @@ def data_curator(state: GraphState) -> dict:
     planning_prompt = textwrap.dedent(f"""\
         You are a data-engineering agent. The user wants to build a model for:
 
-        >>> {user_request} <<<
+        >>> {user_request} <<< 
 
         Step 1: Identify 3 to 5 class categories that make sense for this task.
         Step 2: Decide how many images per class to download. Use your judgment
@@ -819,9 +819,14 @@ def run(user_request: str) -> GraphState:
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    final = run(
-        user_request=(
-            "Build an image classifier that can distinguish between "
-            "cats, dogs, and birds using real-world photos."
-        )
+    import argparse
+    parser = argparse.ArgumentParser(description="Autonomous ML Agent System")
+    parser.add_argument(
+        "--prompt", 
+        type=str, 
+        default="Build an image classifier that can distinguish between cats, dogs, and birds using real-world photos.",
+        help="The natural language request for the model to build."
     )
+    args = parser.parse_args()
+    
+    final = run(user_request=args.prompt)
