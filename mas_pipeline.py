@@ -4,7 +4,7 @@ Autonomous Multi-Agent System (MAS) for Neural Network Curation, Training & Depl
 
 A LangGraph state machine that orchestrates 6 specialized agents:
   1. Data Curator      – Generates synthetic datasets
-  2. Systems Architect – Writes PyTorch training scripts via Gemini
+  2. Systems Architect – Writes PyTorch training scripts via Groq LLM
   3. Executor          – Runs the training script in a subprocess
   4. Critic            – Evaluates execution logs and decides retry/success
   5. MLOps Engineer    – Generates a FastAPI deployment server
@@ -26,7 +26,7 @@ import textwrap
 from typing import TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -49,11 +49,12 @@ class GraphState(TypedDict):
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Change this to switch models globally ──
-# Free-tier models with separate quota buckets you can try:
-#   "gemini-2.0-flash-lite-001"  ← lightweight, generous free quota
-#   "gemini-2.0-flash-001"       ← standard flash
-#   "gemini-1.5-flash"           ← older but very stable
-MODEL_NAME = "gemini-2.0-flash-lite-001"
+# Groq-supported models (all free tier with generous limits):
+#   "llama-3.3-70b-versatile"    ← best quality, 70B params
+#   "llama-3.1-8b-instant"       ← fastest, 8B params
+#   "mixtral-8x7b-32768"         ← Mixtral MoE, 32k context
+#   "gemma2-9b-it"               ← Google Gemma 2, 9B params
+MODEL_NAME = "llama-3.3-70b-versatile"
 
 import time
 
@@ -65,7 +66,7 @@ def _invoke_with_retry(llm, messages, max_retries: int = 5):
             return llm.invoke(messages)
         except Exception as e:
             error_str = str(e)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+            if "429" in error_str or "rate_limit" in error_str.lower():
                 wait = min(2 ** attempt * 10, 120)  # 10s, 20s, 40s, 80s, 120s
                 print(f"[RateLimit] ⏳ Quota hit — waiting {wait}s before retry {attempt + 1}/{max_retries} …")
                 time.sleep(wait)
@@ -74,12 +75,12 @@ def _invoke_with_retry(llm, messages, max_retries: int = 5):
     raise RuntimeError(f"Failed after {max_retries} retries due to rate limiting.")
 
 
-def _get_llm(temperature: float = 0.2) -> ChatGoogleGenerativeAI:
-    """Return a ChatGoogleGenerativeAI instance pointed at a capable model."""
-    return ChatGoogleGenerativeAI(
+def _get_llm(temperature: float = 0.2) -> ChatGroq:
+    """Return a ChatGroq instance pointed at a capable model."""
+    return ChatGroq(
         model=MODEL_NAME,
         temperature=temperature,
-        max_output_tokens=8192,
+        max_tokens=8192,
     )
 
 
