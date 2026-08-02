@@ -13,24 +13,7 @@ A LangGraph state machine that orchestrates 6 specialized agents:
 Run in a Kaggle notebook with a free GPU runtime for best results.
 """
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 0. Kaggle Setup (uncomment these lines when running in a Kaggle notebook)
-# ──────────────────────────────────────────────────────────────────────────────
-# Step 1: Install dependencies (Kaggle has torch/torchvision pre-installed)
-# !pip install -q langgraph langchain-google-genai langchain-core fastapi uvicorn huggingface_hub
-#
-# Step 2: Load your API keys from Kaggle Secrets
-#   → In the Kaggle notebook editor, click Add-ons ▸ Secrets
-#   → Add a secret named "GOOGLE_API_KEY" with your Google AI Studio key
-#   → Add a secret named "HF_TOKEN" with your Hugging Face write token
-#     (create one at https://huggingface.co/settings/tokens → "Write" scope)
-#   → Toggle the switches to grant this notebook access
-#
-# from kaggle_secrets import UserSecretsClient
-# import os
-# secrets = UserSecretsClient()
-# os.environ["GOOGLE_API_KEY"] = secrets.get_secret("GOOGLE_API_KEY")
-# os.environ["HF_TOKEN"] = secrets.get_secret("HF_TOKEN")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Imports
