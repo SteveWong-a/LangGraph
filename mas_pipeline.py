@@ -37,9 +37,10 @@ class GraphState(TypedDict):
     """Shared state that flows through every node in the graph."""
     user_request: str        # The original user prompt describing the task
     dataset_path: str        # Filesystem path to the generated dataset
+    class_names: str         # Comma-separated list of discovered class names
     model_code: str          # Full Python source of the training script
     execution_logs: str      # Combined stdout + stderr from training
-    deployment_package: str  # Full Python source of the FastAPI server
+    deployment_package: str  # Full Python source of the Gradio app
     iteration_count: int     # Number of architect→executor→critic cycles
     hf_repo_url: str         # Hugging Face repo URL after upload
 
@@ -76,11 +77,26 @@ def _invoke_with_retry(llm, messages, max_retries: int = 5):
 
 
 def _get_llm(temperature: float = 0.2) -> ChatGroq:
-    """Return a ChatGroq instance pointed at a capable model."""
+    """Return a ChatGroq text LLM instance."""
     return ChatGroq(
         model=MODEL_NAME,
+        api_key=os.environ.get("GROQ_API_KEY", ""),
         temperature=temperature,
         max_tokens=8192,
+    )
+
+
+# ── Vision model for MLLM labeling ──
+VISION_MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+
+def _get_vision_llm(temperature: float = 0.0) -> ChatGroq:
+    """Return a ChatGroq vision-capable LLM for image classification."""
+    return ChatGroq(
+        model=VISION_MODEL_NAME,
+        api_key=os.environ.get("GROQ_API_KEY", ""),
+        temperature=temperature,
+        max_tokens=256,
     )
 
 
@@ -88,68 +104,202 @@ def _get_llm(temperature: float = 0.2) -> ChatGroq:
 # 4. Agent Nodes
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ── Node 1: Data Curator ─────────────────────────────────────────────────────
+# ── Node 1: Data Curator (Real Images + MLLM Labeling) ───────────────────────
+
+def _strip_code_fences(text: str) -> str:
+    """Remove markdown code fences from LLM output."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines)
+    return text
+
 
 def data_curator(state: GraphState) -> dict:
     """
-    Generate a synthetic image dataset on disk.
+    Download real-world images and label them using a multimodal LLM.
 
-    Uses the Gemini LLM to write a Python script that creates a local folder
-    of synthetic images (random tensors saved as PNGs with class-based
-    subdirectories).  The script is then executed so the dataset exists on
-    disk for downstream training.
+    Stage 1: Use the text LLM to write a script that downloads real images
+             from HuggingFace datasets (based on the user's request).
+    Stage 2: Use a Groq vision model (MLLM) to classify each image into
+             categories derived from the user request.
     """
+    import base64
+    import glob
+    import json
+    from pathlib import Path
+
     llm = _get_llm()
     user_request = state["user_request"]
 
-    prompt = textwrap.dedent(f"""\
-        You are a data-engineering agent.  The user wants to build a model for
-        the following task:
+    # ── Stage 1: Determine categories and download images ────────────────
+    print("[DataCurator] Stage 1: Determining categories and downloading images …")
+
+    planning_prompt = textwrap.dedent(f"""\
+        You are a data-engineering agent. The user wants to build a model for:
 
         >>> {user_request} <<<
 
-        Write a *complete* Python script (no markdown fences, no explanation)
-        that creates a synthetic image dataset at the path "./synthetic_dataset".
+        Step 1: Identify 3 to 5 class categories that make sense for this task.
+        Step 2: Decide how many images per class to download. Use your judgment
+                based on the complexity of the task:
+                - Simple tasks (e.g., binary classification, few classes): 30-50 per class
+                - Moderate tasks (e.g., 3-5 classes, some visual similarity): 50-100 per class
+                - Complex tasks (e.g., fine-grained categories, subtle differences): 100-200 per class
+                Print your decision as: "VOLUME: <N> images per class"
+        Step 3: Write a COMPLETE Python script that:
+          - Uses the `datasets` library from HuggingFace to download a relevant
+            real-world image dataset. Pick one that closely matches the task.
+            Good options: "cifar10", "food101", "beans", "cats_vs_dogs",
+            "fashion_mnist", "mnist", "eurosat", "oxford_flowers102", etc.
+          - Downloads images based on your volume decision from Step 2.
+          - Saves images as PNG files into "./real_dataset/raw/" folder.
+          - Each image should be saved as "img_NNNN.png" (sequential numbering).
+          - Print the class names as: "CLASSES: cat, dog, bird"
+          - Print the total count as: "TOTAL: <N> images downloaded"
+          - Print "Download complete" when done.
+          - The script must handle the case where images are PIL Image objects
+            OR numpy arrays.
+          - Use `split="train"` and slice with `select(range(N))` to limit.
 
-        Requirements:
-        - Use Pillow to generate random-colored 32×32 images.
-        - Create 3 class subdirectories (class_0, class_1, class_2).
-        - Generate 50 images per class (150 total).
-        - Print "Dataset created at ./synthetic_dataset" when done.
-        - The script must be self-contained (import everything it needs).
+        Output ONLY the Python code. No markdown fences, no commentary.
     """)
 
     response = _invoke_with_retry(llm, [
-        SystemMessage(content="You are a senior data engineer. Output ONLY executable Python code, nothing else."),
-        HumanMessage(content=prompt),
+        SystemMessage(content="You are a senior data engineer. Output ONLY executable Python code."),
+        HumanMessage(content=planning_prompt),
     ])
 
-    dataset_script = response.content.strip()
-    # Strip markdown fences if the LLM wraps them
-    if dataset_script.startswith("```"):
-        lines = dataset_script.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        dataset_script = "\n".join(lines)
+    download_script = _strip_code_fences(response.content)
 
-    # Write and execute the data-generation script
-    script_path = "generate_dataset.py"
+    script_path = "download_images.py"
     with open(script_path, "w") as f:
-        f.write(dataset_script)
+        f.write(download_script)
 
+    print("[DataCurator]   Running download script …")
     result = subprocess.run(
         ["python", script_path],
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=300,
     )
 
+    stdout = result.stdout
     if result.returncode != 0:
-        print(f"[DataCurator] ⚠ Dataset script stderr:\n{result.stderr}")
+        print(f"[DataCurator] ⚠ Download script error:\n{result.stderr[:500]}")
     else:
-        print(f"[DataCurator] ✓ {result.stdout.strip()}")
+        print(f"[DataCurator] ✓ {stdout.strip()[-200:]}")
+
+    # Extract class names from script output
+    class_names = []
+    for line in stdout.split("\n"):
+        if line.strip().upper().startswith("CLASSES:"):
+            raw = line.split(":", 1)[1].strip()
+            class_names = [c.strip() for c in raw.split(",") if c.strip()]
+            break
+
+    if not class_names:
+        # Fallback: ask LLM for class names
+        fallback = _invoke_with_retry(llm, [
+            SystemMessage(content="Output ONLY a comma-separated list of class names. Nothing else."),
+            HumanMessage(content=f"List 3-5 image classification categories for: {user_request}"),
+        ])
+        class_names = [c.strip() for c in fallback.content.strip().split(",") if c.strip()]
+
+    if not class_names:
+        class_names = ["class_0", "class_1", "class_2"]
+
+    print(f"[DataCurator]   Classes: {class_names}")
+
+    # ── Stage 2: MLLM labeling with vision model ─────────────────────────
+    print("[DataCurator] Stage 2: Labeling images with vision MLLM …")
+
+    raw_dir = Path("./real_dataset/raw")
+    labeled_dir = Path("./real_dataset/labeled")
+
+    # Create class subdirectories
+    for cls in class_names:
+        (labeled_dir / cls).mkdir(parents=True, exist_ok=True)
+
+    # Gather all images
+    image_files = sorted(
+        glob.glob(str(raw_dir / "*.png"))
+        + glob.glob(str(raw_dir / "*.jpg"))
+        + glob.glob(str(raw_dir / "*.jpeg"))
+    )
+
+    if not image_files:
+        print("[DataCurator] ⚠ No images found in raw dir, falling back to unlabeled.")
+        return {
+            "dataset_path": str(raw_dir),
+            "class_names": ",".join(class_names),
+        }
+
+    vision_llm = _get_vision_llm()
+    classes_str = ", ".join(class_names)
+    labeled_count = {cls: 0 for cls in class_names}
+    total = len(image_files)  # Label all downloaded images
+
+    from langchain_core.messages import HumanMessage as HM
+
+    for i, img_path in enumerate(image_files[:total]):
+        try:
+            with open(img_path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+            # Determine MIME type
+            ext = Path(img_path).suffix.lower()
+            mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(
+                ext.lstrip("."), "image/png"
+            )
+
+            label_msg = HM(
+                content=[
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Classify this image into EXACTLY ONE of these categories: {classes_str}\n"
+                            f"Respond with ONLY the category name, nothing else."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{img_b64}"},
+                    },
+                ]
+            )
+
+            label_response = _invoke_with_retry(vision_llm, [label_msg], max_retries=3)
+            predicted_label = label_response.content.strip().lower()
+
+            # Match to closest class name
+            matched_class = None
+            for cls in class_names:
+                if cls.lower() in predicted_label or predicted_label in cls.lower():
+                    matched_class = cls
+                    break
+            if not matched_class:
+                matched_class = class_names[0]  # Default fallback
+
+            # Copy image to labeled directory
+            import shutil
+            dest = labeled_dir / matched_class / Path(img_path).name
+            shutil.copy2(img_path, dest)
+            labeled_count[matched_class] += 1
+
+            if (i + 1) % 10 == 0:
+                print(f"[DataCurator]   Labeled {i + 1}/{total} images …")
+
+        except Exception as e:
+            print(f"[DataCurator]   ⚠ Failed to label {Path(img_path).name}: {e}")
+            continue
+
+    print(f"[DataCurator] ✓ Labeling complete: {dict(labeled_count)}")
 
     return {
-        "dataset_path": "./synthetic_dataset",
+        "dataset_path": str(labeled_dir),
+        "class_names": ",".join(class_names),
     }
 
 
@@ -157,7 +307,7 @@ def data_curator(state: GraphState) -> dict:
 
 def systems_architect(state: GraphState) -> dict:
     """
-    Use Gemini to write a complete PyTorch training script.
+    Use the LLM to write a complete PyTorch training script.
 
     If previous execution logs contain errors (from a retry loop), they are
     included in the prompt so the LLM can fix the issues.
@@ -165,6 +315,8 @@ def systems_architect(state: GraphState) -> dict:
     llm = _get_llm(temperature=0.3)
     user_request = state["user_request"]
     dataset_path = state["dataset_path"]
+    class_names = state.get("class_names", "")
+    num_classes = max(len(class_names.split(",")), 2) if class_names else 3
     previous_logs = state.get("execution_logs", "")
 
     error_context = ""
@@ -182,7 +334,9 @@ def systems_architect(state: GraphState) -> dict:
 
         USER TASK: {user_request}
         DATASET PATH: {dataset_path}
-        (The dataset has subdirectories class_0, class_1, class_2 with 32×32 PNG images.)
+        CLASS NAMES: {class_names}
+        NUMBER OF CLASSES: {num_classes}
+        (The dataset has subdirectories named after each class with real-world PNG/JPG images.)
 
         {error_context}
 
@@ -193,7 +347,7 @@ def systems_architect(state: GraphState) -> dict:
         2. Load the dataset from "{dataset_path}" using
            torchvision.datasets.ImageFolder and a DataLoader.
         3. Define a simple CNN (Conv2d → ReLU → MaxPool → Flatten → Linear).
-           The CNN must accept 3-channel 32×32 images and output 3 classes.
+           The CNN must accept 3-channel 64×64 images and output {num_classes} classes.
         4. Use CrossEntropyLoss and Adam optimizer (lr=1e-3).
         5. Train for exactly 5 epochs.
         6. After each epoch, print: "Epoch {{epoch}}/5 — Loss: {{avg_loss:.4f}}"
@@ -201,7 +355,8 @@ def systems_architect(state: GraphState) -> dict:
            torch.save(model.state_dict(), "best_model.pt").
         8. Print "Training complete. Model saved to best_model.pt" at the end.
         9. Handle the case where CUDA is not available by falling back to CPU.
-        10. Use torchvision.transforms to Resize(32), ToTensor(), and Normalize.
+        10. Use torchvision.transforms to Resize(64), ToTensor(), and Normalize.
+        11. Use num_workers=0 in DataLoader (required for Kaggle).
 
         Output ONLY the Python code. No markdown fences, no commentary.
     """)
@@ -310,21 +465,22 @@ def critic(state: GraphState) -> dict:
     }
 
 
-# ── Node 5: MLOps Engineer ───────────────────────────────────────────────────
+# ── Node 5: MLOps Engineer (Gradio + Model Download) ─────────────────────────
 
 def mlops_engineer(state: GraphState) -> dict:
     """
-    Generate a FastAPI app that serves the trained model as a REST endpoint.
+    Generate a Gradio app that serves the trained model with a download button.
     """
     llm = _get_llm(temperature=0.2)
     user_request = state["user_request"]
     model_code = state["model_code"]
+    class_names = state.get("class_names", "class_0,class_1,class_2")
 
-    # Extract the model class definition from model_code for reuse
     prompt = textwrap.dedent(f"""\
         You are a senior MLOps engineer.
 
         The user trained a PyTorch model for: {user_request}
+        The class names are: {class_names}
 
         Here is the training script that was used (you need the model class
         definition from it):
@@ -332,19 +488,39 @@ def mlops_engineer(state: GraphState) -> dict:
         {model_code[:4000]}
         ---
 
-        Write a COMPLETE FastAPI application in a single file called `app.py`
+        Write a COMPLETE Gradio application in a single file called `app.py`
         that does the following:
 
-        1. Import FastAPI, torch, torchvision.transforms, PIL, io, base64.
+        1. Import gradio, torch, torchvision.transforms, PIL.
         2. Re-define the EXACT same model class used in training.
-        3. On startup, load the weights from "best_model.pt" onto CPU.
-        4. Expose a POST endpoint at "/predict" that:
-           a. Accepts a JSON body with a "image_base64" field (base64-encoded PNG).
-           b. Decodes the image, applies the same transforms used in training.
-           c. Runs inference and returns the predicted class index and
-              confidence scores as JSON.
-        5. Expose a GET endpoint at "/health" that returns {{"status": "ok"}}.
-        6. Add `if __name__ == "__main__": uvicorn.run(app, host="0.0.0.0", port=8000)`.
+        3. Load the weights from "best_model.pt" onto CPU at module level.
+        4. Define the class names as a list: {class_names.split(",")}.
+        5. Create a prediction function that:
+           a. Takes a PIL Image as input.
+           b. Applies the same transforms used in training (Resize(64),
+              ToTensor(), Normalize).
+           c. Runs inference and returns a dict mapping class names to
+              confidence scores (use torch.nn.functional.softmax).
+        6. Build a Gradio Interface with:
+           a. gr.Image(type="pil") as input.
+           b. gr.Label(num_top_classes=len(class_names)) as output.
+           c. A title like "Image Classifier — {{task description}}".
+           d. A description explaining what the model does.
+        7. IMPORTANT: Add a model download component. Use gr.File with
+           value="best_model.pt" so users can download the trained weights.
+           Place it below the main interface using gr.Blocks layout:
+
+           with gr.Blocks() as demo:
+               gr.Markdown("# Title")
+               with gr.Row():
+                   image_input = gr.Image(type="pil")
+                   label_output = gr.Label()
+               predict_btn = gr.Button("Classify")
+               predict_btn.click(predict, inputs=image_input, outputs=label_output)
+               gr.Markdown("### Download Model")
+               gr.File(value="best_model.pt", label="Download trained model weights")
+
+        8. Launch with: demo.launch()
 
         Output ONLY the Python code. No markdown fences, no commentary.
     """)
@@ -354,17 +530,13 @@ def mlops_engineer(state: GraphState) -> dict:
         HumanMessage(content=prompt),
     ])
 
-    deployment_code = response.content.strip()
-    if deployment_code.startswith("```"):
-        lines = deployment_code.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        deployment_code = "\n".join(lines)
+    deployment_code = _strip_code_fences(response.content)
 
     # Write the deployment file to disk
     with open("app.py", "w") as f:
         f.write(deployment_code)
 
-    print(f"[MLOpsEngineer] ✓ Generated app.py ({len(deployment_code)} chars)")
+    print(f"[MLOpsEngineer] ✓ Generated Gradio app.py ({len(deployment_code)} chars)")
 
     return {
         "deployment_package": deployment_code,
@@ -595,6 +767,7 @@ def run(user_request: str) -> GraphState:
     initial_state: GraphState = {
         "user_request": user_request,
         "dataset_path": "",
+        "class_names": "",
         "model_code": "",
         "execution_logs": "",
         "deployment_package": "",
@@ -615,12 +788,14 @@ def run(user_request: str) -> GraphState:
     print("=" * 72)
 
     if final_state.get("deployment_package"):
-        print("  ✓ Model trained and deployment server generated.")
+        class_names = final_state.get("class_names", "")
+        print("  ✓ Model trained and Gradio app generated.")
+        print(f"  ✓ Classes: {class_names}")
         print("  ✓ Files created:")
-        print("    • synthetic_dataset/   (training data)")
+        print("    • real_dataset/        (AI-labeled training data)")
         print("    • train.py             (training script)")
         print("    • best_model.pt        (saved weights)")
-        print("    • app.py               (FastAPI server)")
+        print("    • app.py               (Gradio app + model download)")
         hf_url = final_state.get("hf_repo_url", "")
         if hf_url and "ERROR" not in hf_url and "SKIPPED" not in hf_url:
             print(f"\n  ✓ Model published to Hugging Face:")
@@ -629,7 +804,7 @@ def run(user_request: str) -> GraphState:
             print(f"\n  ⚠ HF upload skipped (set HF_TOKEN to enable).")
         else:
             print(f"\n  ✗ HF upload failed: {hf_url}")
-        print(f"\n  To start the server locally:\n    $ python app.py")
+        print(f"\n  To launch Gradio:\n    $ python app.py")
     else:
         print("  ✗ Pipeline ended without a deployment package.")
         print(f"  Iterations used: {final_state.get('iteration_count', '?')}/3")
@@ -647,6 +822,6 @@ if __name__ == "__main__":
     final = run(
         user_request=(
             "Build an image classifier that can distinguish between "
-            "three categories of synthetic patterns."
+            "cats, dogs, and birds using real-world photos."
         )
     )
