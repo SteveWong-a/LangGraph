@@ -51,7 +51,7 @@ class GraphState(TypedDict):
 def _get_llm(temperature: float = 0.2) -> ChatGoogleGenerativeAI:
     """Return a ChatGoogleGenerativeAI instance pointed at a capable model."""
     return ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        model="gemini-2.0-flash-001",
         temperature=temperature,
         max_output_tokens=8192,
     )
