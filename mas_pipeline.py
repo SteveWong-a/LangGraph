@@ -166,30 +166,41 @@ def data_curator(state: GraphState) -> dict:
         Output ONLY the Python code. No markdown fences, no commentary.
     """)
 
-    response = _invoke_with_retry(llm, [
-        SystemMessage(content="You are a senior data engineer. Output ONLY executable Python code."),
-        HumanMessage(content=planning_prompt),
-    ])
+    for attempt in range(3):
+        response = _invoke_with_retry(llm, [
+            SystemMessage(content="You are a senior data engineer. Output ONLY executable Python code."),
+            HumanMessage(content=planning_prompt),
+        ])
 
-    download_script = _strip_code_fences(response.content)
+        download_script = _strip_code_fences(response.content)
 
-    script_path = "download_images.py"
-    with open(script_path, "w") as f:
-        f.write(download_script)
+        script_path = f"download_images_{attempt}.py"
+        with open(script_path, "w") as f:
+            f.write(download_script)
 
-    print("[DataCurator]   Running download script …")
-    result = subprocess.run(
-        ["python", script_path],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
+        print(f"[DataCurator]   Running download script (attempt {attempt+1}/3) …")
+        result = subprocess.run(
+            ["python", script_path],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
 
-    stdout = result.stdout
-    if result.returncode != 0:
-        print(f"[DataCurator] ⚠ Download script error:\n{result.stderr[:500]}")
+        stdout = result.stdout
+        if result.returncode == 0:
+            print(f"[DataCurator] ✓ {stdout.strip()[-200:]}")
+            break
+        else:
+            print(f"[DataCurator] ⚠ Download script error:\n{result.stderr[:500]}")
+            planning_prompt += textwrap.dedent(f"""\
+            
+            ⚠ PREVIOUS ATTEMPT FAILED WITH ERROR:
+            {result.stderr[-1000:]}
+            
+            You MUST fix the error. If the dataset cannot be loaded (e.g., config name needed, trust_remote_code=True, or dataset doesn't exist), pick a DIFFERENT fallback dataset from HuggingFace (e.g., 'cifar10', 'cats_vs_dogs', 'food101') instead.
+            """)
     else:
-        print(f"[DataCurator] ✓ {stdout.strip()[-200:]}")
+        print("[DataCurator] ⚠ All download attempts failed. The dataset will be empty.")
 
     # Extract class names from script output
     class_names = []
