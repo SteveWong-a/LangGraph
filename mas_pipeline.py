@@ -159,8 +159,9 @@ def data_curator(state: GraphState) -> dict:
           - Print the class names as: "CLASSES: cat, dog, bird"
           - Print the total count as: "TOTAL: <N> images downloaded"
           - Print "Download complete" when done.
-          - The script must handle the case where images are PIL Image objects
-            OR numpy arrays.
+          - You MUST disable datasets progress bars at the top: `from datasets.utils.logging import disable_progress_bar; disable_progress_bar()`
+          - The script must handle the case where images are PIL Image objects OR numpy arrays.
+          - IMPORTANT: Do NOT assume the image column is named "image". CIFAR-10 uses "img". You MUST dynamically find the image column by checking `dataset[0].keys()`.
           - Use `split="train"` and slice with `select(range(N))` to limit.
 
         Output ONLY the Python code. No markdown fences, no commentary.
